@@ -25,13 +25,18 @@ from tensorflow.python.ipu.autoshard import automatic_sharding
 from tensorflow.python.ipu import loops, ipu_infeed_queue, ipu_outfeed_queue, ipu_compiler
 from tensorflow.python.ipu.ipu_optimizer import CrossReplicaOptimizer
 from tensorflow.python.ipu.gradient_accumulation_optimizer import GradientAccumulationOptimizer
-from tensorflow.python.ipu.utils import reset_ipu_seed
+from tensorflow.python.ipu.utils import reset_ipu_seed, SelectionOrder
 from tensorflow.python.ipu.ops import pipelining_ops
 from ipu_optimizer import IPUOptimizer
 from tensorflow.python.ipu.scopes import ipu_scope
 import Datasets.data as dataset
 DATASET_CONSTANTS = dataset.DATASET_CONSTANTS
 
+from manual_sharding import manual_sharding, find_all_spliting_nodes
+
+from gc_profile import save_tf_report
+from tensorflow.compiler.plugin.poplar.ops import gen_ipu_ops
+# import ptvsd
 
 GraphOps = namedtuple(
     'graphOps', ['graph',
@@ -105,8 +110,17 @@ def basic_training_step(image, label, model, opts, learning_rate):
         def filter(edge):
             return (any(f in e for e in edge for f in opts["sharding_exclude_filter"]) or
                     not any(f in e for e in edge for f in opts["sharding_include_filter"]))
-        automatic_sharding(opts['shards'], image, cross_entropy, edge_filter=filter)
 
+        if opts['sharding_all'] is True:
+            split_nodes = find_all_spliting_nodes(image, cross_entropy,
+                                                    node_matcher=lambda node: 'relu' in node)
+            print('split_nodes={}'.format(split_nodes))
+            manual_sharding(image, cross_entropy, split_nodes)
+        elif opts['sharding_splits'] is not None:
+            split_nodes = opts['sharding_splits']
+            manual_sharding(image, cross_entropy, split_nodes)
+        else:
+            automatic_sharding(opts['shards'], image, cross_entropy, edge_filter=filter)
     return loss, cross_entropy, accuracy, learning_rate, train_op
 
 
@@ -223,15 +237,32 @@ def training_graph(model, opts, iterations_per_step=1):
     if opts["available_memory_proportion"] and len(opts["available_memory_proportion"]) == 1:
         globalAMP = opts["available_memory_proportion"][0]
 
-    ipu_options = get_config(ipu_id=opts["select_ipu"],
-                             prng=not opts["no_stochastic_rounding"],
-                             shards=opts["shards"],
-                             number_of_replicas=opts['replicas'],
-                             max_cross_replica_buffer_size=opts["max_cross_replica_buffer_size"],
-                             fp_exceptions=opts["fp_exceptions"],
-                             xla_recompute=opts["xla_recompute"],
-                             seed=opts["seed"],
-                             availableMemoryProportion=globalAMP)
+    if opts['profiling'] is True:
+        ipu_options = get_config(ipu_id=opts["select_ipu"],
+                                prng=not opts["no_stochastic_rounding"],
+                                shards=opts["shards"],
+                                number_of_replicas=opts['replicas'],
+                                max_cross_replica_buffer_size=opts["max_cross_replica_buffer_size"],
+                                fp_exceptions=opts["fp_exceptions"],
+                                xla_recompute=opts["xla_recompute"],
+                                seed=opts["seed"],
+                                availableMemoryProportion=globalAMP,
+                                selection_order=SelectionOrder.ZIGZAG,
+                                max_report_size=268435456000,
+                                #use_poplar_text_report=True,
+                                report_directory="report_directory",
+                                profiling=True,
+                                profile_execution=True)
+    else:
+        ipu_options = get_config(ipu_id=opts["select_ipu"],
+                                prng=not opts["no_stochastic_rounding"],
+                                shards=opts["shards"],
+                                number_of_replicas=opts['replicas'],
+                                max_cross_replica_buffer_size=opts["max_cross_replica_buffer_size"],
+                                fp_exceptions=opts["fp_exceptions"],
+                                xla_recompute=opts["xla_recompute"],
+                                seed=opts["seed"],
+                                availableMemoryProportion=globalAMP)
 
     ipu.utils.configure_ipu_system(ipu_options)
     train_sess = tf.Session(graph=train_graph, config=tf.ConfigProto())
@@ -284,6 +315,11 @@ def train_process(model, LR_Class, opts):
     # -------------- BUILD TRAINING GRAPH ----------------
 
     train = training_graph(model, opts, iterations_per_step*opts["gradients_to_accumulate"])
+
+    if opts['profiling'] is True:
+        with tf.device('cpu'):
+            report = gen_ipu_ops.ipu_event_trace()
+
     train.session.run(train.init)
     train.session.run(train.iterator.initializer)
 
@@ -404,6 +440,11 @@ def train_process(model, LR_Class, opts):
     # --------------- CLEANUP ----------------
     train.session.close()
 
+    if opts['profiling'] is True:
+        with tf.Session() as sess:
+            summary = sess.run(report)
+        #save_tf_report(summary)
+
 
 def add_main_arguments(parser, required=True):
     group = parser.add_argument_group('Main')
@@ -461,6 +502,11 @@ def add_training_arguments(parser):
                           help="Optimiser")
     tr_group.add_argument('--momentum', type=float, default=0.9,
                           help="Momentum coefficient")
+    tr_group.add_argument('--profiling', default=False, action='store_true', help = "profiling")
+    tr_group.add_argument('--sharding-splits', nargs='+', type=str, default=None,
+                          help="Strings for manual sharding. E.g. b2/0/relu b3/0/relu")
+    tr_group.add_argument('--sharding-all', default=False, action='store_true',
+                          help = "Sharding by all possible split nodes")
     return parser
 
 
@@ -573,6 +619,11 @@ def set_defaults(model, LR, opts):
 
 
 if __name__ == '__main__':
+    #print("Waiting for debugger attach")
+    #ptvsd.enable_attach(address=('localhost', 5678), redirect_output=True)
+    #ptvsd.wait_for_attach()
+    #breakpoint()
+
     parser = argparse.ArgumentParser(description='CNN Training in TensorFlow', add_help=False)
     parser = add_main_arguments(parser)
     args, unknown = parser.parse_known_args()
