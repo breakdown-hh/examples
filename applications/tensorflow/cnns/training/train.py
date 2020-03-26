@@ -250,7 +250,7 @@ def training_graph(model, opts, iterations_per_step=1):
                                 selection_order=SelectionOrder.ZIGZAG,
                                 max_report_size=268435456000,
                                 #use_poplar_text_report=True,
-                                report_directory="report_directory",
+                                report_directory=opts["report_directory"],
                                 profiling=True,
                                 profile_execution=True)
     else:
@@ -503,6 +503,7 @@ def add_training_arguments(parser):
     tr_group.add_argument('--momentum', type=float, default=0.9,
                           help="Momentum coefficient")
     tr_group.add_argument('--profiling', default=False, action='store_true', help = "profiling")
+    tr_group.add_argument('--report-directory', type=str, default="report_directory", help = "report_directory")
     tr_group.add_argument('--sharding-splits', nargs='+', type=str, default=None,
                           help="Strings for manual sharding. E.g. b2/0/relu b3/0/relu")
     tr_group.add_argument('--sharding-all', default=False, action='store_true',
